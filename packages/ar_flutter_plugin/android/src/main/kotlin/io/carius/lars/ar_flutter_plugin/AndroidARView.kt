@@ -5,13 +5,23 @@ import android.animation.AnimatorListenerAdapter
 import android.animation.ValueAnimator
 import android.app.Activity
 import android.app.Application
+import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.RectF
+import android.graphics.Typeface
 import android.net.Uri
 import android.os.Bundle
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
+import android.provider.MediaStore
 import android.util.Log
 import android.view.MotionEvent
 import android.view.PixelCopy
@@ -100,6 +110,7 @@ internal class AndroidARView(
     private val appearanceAnimators = mutableMapOf<String, ValueAnimator>()
     private val roamingNodes = mutableSetOf<String>()
     private val roamingMovements = mutableMapOf<String, ValueAnimator>()
+    private val orientationTurns = mutableMapOf<String, ValueAnimator>()
     private val outOfViewSince = mutableMapOf<String, Long>()
     private val lastRoamAt = mutableMapOf<String, Long>()
     // Cloud anchor handler
@@ -133,35 +144,35 @@ internal class AndroidARView(
                                 result.error("Error", "could not get camera pose", null)
                             }
                         }
-                        "snapshot" -> {
-                            var bitmap = Bitmap.createBitmap(arSceneView.width, arSceneView.height,
-                                    Bitmap.Config.ARGB_8888);
-
-
-                            // Create a handler thread to offload the processing of the image.
-                            var handlerThread = HandlerThread("PixelCopier");
-                            handlerThread.start();
-                            // Make the request to copy.
-                            PixelCopy.request(arSceneView, bitmap, { copyResult:Int ->
-                                Log.d(TAG, "PIXELCOPY DONE")
-                                if (copyResult == PixelCopy.SUCCESS) {
-                                    try {
-                                        val mainHandler = Handler(context.mainLooper)
-                                        val runnable = Runnable {
-                                            val stream = ByteArrayOutputStream()
-                                            bitmap.compress(Bitmap.CompressFormat.PNG, 90, stream)
-                                            val data = stream.toByteArray()
-                                            result.success(data)
-                                        }
-                                        mainHandler.post(runnable)
-                                    } catch (e: IOException) {
-                                        result.error("e", e.message, e.stackTrace);
-                                    }
-                                } else {
-                                    result.error("e", "failed to take screenshot", null);
+                        "snapshot", "captureFramedPhoto" -> captureFrame(
+                            result, call.method == "captureFramedPhoto",
+                        )
+                        "savePhoto" -> {
+                            val bytes = call.argument<ByteArray>("bytes")
+                            if (bytes == null) result.error("EMPTY_PHOTO", "No hay foto para guardar", null)
+                            else try {
+                                result.success(savePhoto(bytes).toString())
+                            } catch (e: SecurityException) {
+                                result.error("STORAGE_PERMISSION_REQUIRED", "Permite guardar fotos", null)
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Unable to save AR photo", e)
+                                result.error("SAVE_FAILED", e.localizedMessage, null)
+                            }
+                        }
+                        "sharePhoto" -> {
+                            val uri = call.argument<String>("uri")
+                            if (uri == null) result.error("EMPTY_PHOTO", "No hay foto para compartir", null)
+                            else try {
+                                val send = Intent(Intent.ACTION_SEND).apply {
+                                    type = "image/png"
+                                    putExtra(Intent.EXTRA_STREAM, Uri.parse(uri))
+                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                                 }
-                                handlerThread.quitSafely();
-                            }, Handler(handlerThread.looper));
+                                activity.startActivity(Intent.createChooser(send, "Compartir foto BioInnova"))
+                                result.success(null)
+                            } catch (e: Exception) {
+                                result.error("SHARE_FAILED", e.localizedMessage, null)
+                            }
                         }
                         "dispose" -> {
                             dispose()
@@ -212,6 +223,7 @@ internal class AndroidARView(
                                 appearanceAnimators.remove(it)?.cancel()
                                 roamingNodes.remove(it)
                                 roamingMovements.remove(it)?.cancel()
+                                orientationTurns.remove(it)?.cancel()
                                 outOfViewSince.remove(it)
                                 lastRoamAt.remove(it)
                                 if (transformationSystem.selectedNode?.name == nodeName){
@@ -463,6 +475,95 @@ internal class AndroidARView(
         sessionManagerChannel.invokeMethod("onError", listOf(message))
     }
 
+    private fun captureFrame(result: MethodChannel.Result, withFrame: Boolean) {
+        val width = arSceneView.width
+        val height = arSceneView.height
+        if (width <= 0 || height <= 0) {
+            result.error("CAPTURE_NOT_READY", "La cámara aún no está lista", null)
+            return
+        }
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val worker = HandlerThread("BioInnovaPhoto").apply { start() }
+        PixelCopy.request(arSceneView, bitmap, { copyResult ->
+            try {
+                if (copyResult != PixelCopy.SUCCESS) {
+                    throw IOException("No se pudo capturar la cámara ($copyResult)")
+                }
+                if (withFrame) drawEventFrame(bitmap)
+                val stream = ByteArrayOutputStream()
+                bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream)
+                val bytes = stream.toByteArray()
+                Handler(viewContext.mainLooper).post { result.success(bytes) }
+            } catch (e: Exception) {
+                Log.e(TAG, "AR photo capture failed", e)
+                Handler(viewContext.mainLooper).post {
+                    result.error("CAPTURE_FAILED", e.localizedMessage, null)
+                }
+            } finally {
+                bitmap.recycle()
+                worker.quitSafely()
+            }
+        }, Handler(worker.looper))
+    }
+
+    private fun drawEventFrame(photo: Bitmap) {
+        val asset = if (photo.width > photo.height) {
+            "assets/frames/marco_horizontal.png"
+        } else {
+            "assets/frames/marco_vertical.png"
+        }
+        val key = FlutterInjector.instance().flutterLoader().getLookupKeyForAsset(asset)
+        val frame = viewContext.assets.open(key).use { BitmapFactory.decodeStream(it) }
+            ?: throw IOException("No se pudo cargar el marco del evento")
+        val canvas = Canvas(photo)
+        canvas.drawBitmap(
+            frame, null, RectF(0f, 0f, photo.width.toFloat(), photo.height.toFloat()),
+            Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG),
+        )
+        frame.recycle()
+        val shortSide = minOf(photo.width, photo.height).toFloat()
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            textAlign = Paint.Align.CENTER
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            textSize = shortSide * 0.028f
+            setShadowLayer(shortSide * 0.012f, 0f, shortSide * 0.003f, Color.rgb(6, 38, 19))
+        }
+        canvas.drawText("ENCUENTRO REGIONAL AMAZÓNICO", photo.width / 2f, shortSide * 0.07f, paint)
+        paint.color = Color.rgb(255, 247, 233)
+        canvas.drawText(
+            "SAN MARTÍN 2026 · BIOINNOVA", photo.width / 2f,
+            photo.height - shortSide * 0.05f, paint,
+        )
+    }
+
+    private fun savePhoto(bytes: ByteArray): Uri {
+        val resolver = viewContext.contentResolver
+        val values = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, "BioInnova_${System.currentTimeMillis()}.png")
+            put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/BioInnova")
+                put(MediaStore.Images.Media.IS_PENDING, 1)
+            }
+        }
+        val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            ?: throw IOException("No se pudo crear la foto en la galería")
+        try {
+            resolver.openOutputStream(uri)?.use { it.write(bytes) }
+                ?: throw IOException("No se pudo escribir la foto")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                resolver.update(uri, ContentValues().apply {
+                    put(MediaStore.Images.Media.IS_PENDING, 0)
+                }, null, null)
+            }
+            return uri
+        } catch (e: Exception) {
+            resolver.delete(uri, null, null)
+            throw e
+        }
+    }
+
     fun onResume() {
         // Create session if there is none
         if (arSceneView.session == null) {
@@ -556,6 +657,8 @@ internal class AndroidARView(
             appearanceAnimators.clear()
             roamingMovements.values.toList().forEach { it.cancel() }
             roamingMovements.clear()
+            orientationTurns.values.toList().forEach { it.cancel() }
+            orientationTurns.clear()
             roamingNodes.clear()
             outOfViewSince.clear()
             lastRoamAt.clear()
@@ -805,6 +908,7 @@ internal class AndroidARView(
 
     private fun animateCharacterTo(name: String, node: Node, targetWorld: Vector3): Boolean {
         roamingMovements.remove(name)?.cancel()
+        orientationTurns.remove(name)?.cancel()
         val start = Vector3(node.localPosition.x, node.localPosition.y, node.localPosition.z)
         val target = (node.parent as? Node)?.worldToLocalPoint(targetWorld) ?: targetWorld
         val dx = target.x - start.x
@@ -813,6 +917,10 @@ internal class AndroidARView(
         if (distance < 0.15f) return false
         val end = Vector3(target.x, target.y, target.z)
         val travelYaw = Math.toDegrees(atan2(dx.toDouble(), dz.toDouble())).toFloat()
+        val startRotation = node.localRotation
+        val travelRotation = com.google.ar.sceneform.math.Quaternion.axisAngle(
+            Vector3(0f, 1f, 0f), travelYaw,
+        )
         val movement = ValueAnimator.ofFloat(0f, 1f).apply {
             duration = (distance / 0.75f * 1000f).toLong().coerceIn(900L, 6500L)
             addUpdateListener { value ->
@@ -822,8 +930,8 @@ internal class AndroidARView(
                     start.y + (end.y - start.y) * progress,
                     start.z + (end.z - start.z) * progress,
                 )
-                node.localRotation = com.google.ar.sceneform.math.Quaternion.axisAngle(
-                    Vector3(0f, 1f, 0f), travelYaw,
+                node.localRotation = com.google.ar.sceneform.math.Quaternion.slerp(
+                    startRotation, travelRotation, (progress * 4f).coerceIn(0f, 1f),
                 )
             }
             addListener(object : AnimatorListenerAdapter() {
@@ -831,7 +939,7 @@ internal class AndroidARView(
                     if (roamingMovements[name] !== this@apply) return
                     roamingMovements.remove(name)
                     if (arSceneView.scene.findByName(name) != null) {
-                        faceCharacterTowardCamera(node)
+                        turnCharacterTowardCamera(name, node)
                         activeAnimators[name]?.cancel()
                         playAnimationContaining(name, listOf("wave", "talk"), loop = false)
                         outOfViewSince.remove(name)
@@ -847,16 +955,32 @@ internal class AndroidARView(
         return true
     }
 
-    private fun faceCharacterTowardCamera(node: Node) {
+    private fun turnCharacterTowardCamera(name: String, node: Node) {
         val cameraWorld = arSceneView.scene.camera.worldPosition
         val cameraLocal = (node.parent as? Node)?.worldToLocalPoint(cameraWorld) ?: cameraWorld
         val dx = cameraLocal.x - node.localPosition.x
         val dz = cameraLocal.z - node.localPosition.z
         if (dx * dx + dz * dz < 0.01f) return
         val yaw = Math.toDegrees(atan2(dx.toDouble(), dz.toDouble())).toFloat()
-        node.localRotation = com.google.ar.sceneform.math.Quaternion.axisAngle(
+        val targetRotation = com.google.ar.sceneform.math.Quaternion.axisAngle(
             Vector3(0f, 1f, 0f), yaw,
         )
+        val startRotation = node.localRotation
+        val turn = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 420L
+            addUpdateListener { value ->
+                node.localRotation = com.google.ar.sceneform.math.Quaternion.slerp(
+                    startRotation, targetRotation, value.animatedValue as Float,
+                )
+            }
+            addListener(object : AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: Animator) {
+                    if (orientationTurns[name] === this@apply) orientationTurns.remove(name)
+                }
+            })
+        }
+        orientationTurns[name] = turn
+        turn.start()
     }
 
     private fun findModelRenderable(name: String): RenderableInstance? =

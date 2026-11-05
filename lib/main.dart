@@ -13,7 +13,8 @@ import 'package:ar_flutter_plugin/managers/ar_object_manager.dart';
 import 'package:ar_flutter_plugin/managers/ar_session_manager.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_tts/flutter_tts.dart';
+import 'package:audioplayers/audioplayers.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:vector_math/vector_math_64.dart' as vm;
 
 void main() {
@@ -41,6 +42,7 @@ abstract final class Brand {
 const _guideScenes = <_GuideScene>[
   _GuideScene(
     title: 'Bienvenida',
+    audioAsset: 'assets/audio/introduccion.mp3',
     movement: 'El otorongo te da la bienvenida',
     script:
         '¡Hola, hola! ¡Qué alegría tenerlos por aquí! ¡Bienvenidos al '
@@ -52,6 +54,7 @@ const _guideScenes = <_GuideScene>[
   ),
   _GuideScene(
     title: 'Jornada y Speed Mentoring',
+    audioAsset: 'assets/audio/jornada_empresarial.mp3',
     movement: 'Señala hacia adelante',
     script:
         '¿Vienes a conectar, aprender y generar nuevas oportunidades? '
@@ -63,6 +66,7 @@ const _guideScenes = <_GuideScene>[
   ),
   _GuideScene(
     title: 'Feria de emprendimientos',
+    audioAsset: 'assets/audio/feria_emprendimientos.mp3',
     movement: 'Gira y señala a tu derecha',
     script:
         '¡Pero eso no es todo! Si quieres descubrir productos innovadores, '
@@ -75,6 +79,7 @@ const _guideScenes = <_GuideScene>[
   ),
   _GuideScene(
     title: 'Despedida',
+    audioAsset: 'assets/audio/despedida.mp3',
     movement: 'El otorongo se despide',
     script:
         '¡Tenemos mucho por descubrir! Prepárate para conectar, compartir e '
@@ -93,6 +98,7 @@ class _GuideScene {
     required this.title,
     required this.movement,
     required this.script,
+    required this.audioAsset,
     required this.animationKeywords,
     required this.directionIcon,
     this.facingYaw = 0,
@@ -101,6 +107,7 @@ class _GuideScene {
   final String title;
   final String movement;
   final String script;
+  final String audioAsset;
   final List<String> animationKeywords;
   final IconData directionIcon;
   final double facingYaw;
@@ -419,11 +426,18 @@ class _ARExperiencePageState extends State<ARExperiencePage> {
   ARAnchorManager? _anchorsManager;
   ARPlaneAnchor? _anchor;
   ARNode? _tigrillo;
-  final FlutterTts _tts = FlutterTts();
+  final AudioPlayer _narration = AudioPlayer();
+  StreamSubscription<void>? _narrationCompletedSubscription;
+  Completer<void>? _narrationFinished;
   final List<_CharacterAnimation> _animations = [];
   Timer? _animationTimer;
+  Timer? _gestureTimer;
+  bool _speaking = false;
+  bool _jumping = false;
   bool _placed = false;
   bool _busy = false;
+  bool _capturingPhoto = false;
+  Uint8List? _photoBytes;
   bool _sound = true;
   String _status = 'Toca la pantalla para hacer aparecer al tigrillo';
   int _autoAnimationIndex = 0;
@@ -433,59 +447,20 @@ class _ARExperiencePageState extends State<ARExperiencePage> {
   @override
   void initState() {
     super.initState();
-    _configureVoice();
+    _narrationCompletedSubscription = _narration.onPlayerComplete.listen((_) {
+      _finishNarration();
+    });
   }
 
-  Future<void> _configureVoice() async {
-    await _tts.setLanguage('es-MX');
-    try {
-      final voices = await _tts.getVoices;
-      if (voices is List) {
-        final spanish = voices.whereType<Map>().where((voice) {
-          final locale = '${voice['locale']}'.toLowerCase().replaceAll(
-            '_',
-            '-',
-          );
-          return locale == 'es-419' ||
-              [
-                'es-pe',
-                'es-mx',
-                'es-us',
-                'es-co',
-                'es-ar',
-                'es-cl',
-              ].contains(locale);
-        }).toList();
-        for (final preferred in [
-          'es-pe',
-          'es-mx',
-          'es-419',
-          'es-co',
-          'es-us',
-          'es-ar',
-          'es-cl',
-        ]) {
-          final matches = spanish.where(
-            (voice) =>
-                '${voice['locale']}'.toLowerCase().replaceAll('_', '-') ==
-                preferred,
-          );
-          if (matches.isEmpty) continue;
-          final voice = matches.first;
-          await _tts.setVoice({
-            'name': '${voice['name']}',
-            'locale': '${voice['locale']}',
-          });
-          break;
-        }
-      }
-    } catch (error) {
-      debugPrint('Se usará la voz latinoamericana predeterminada: $error');
-    }
-    await _tts.setSpeechRate(.52);
-    await _tts.setPitch(1.0);
-    await _tts.setVolume(1);
-    await _tts.awaitSpeakCompletion(true);
+  void _finishNarration() {
+    final pending = _narrationFinished;
+    if (pending != null && !pending.isCompleted) pending.complete();
+    _narrationFinished = null;
+  }
+
+  Future<void> _stopNarration() async {
+    _finishNarration();
+    await _narration.stop();
   }
 
   void _onARCreated(
@@ -506,6 +481,9 @@ class _ARExperiencePageState extends State<ARExperiencePage> {
       handleRotation: false,
     );
     objects.onInitialize();
+    objects.onNodeTap = (names) {
+      if (names.contains(_tigrillo?.name)) _playSurpriseJump();
+    };
     session.onPlaneOrPointTap = _onSurfaceTap;
     _setStatus('Toca la pantalla para hacer aparecer al tigrillo');
   }
@@ -597,11 +575,12 @@ class _ARExperiencePageState extends State<ARExperiencePage> {
     }
   }
 
-  Future<void> _playByKeyword(
+  Future<_CharacterAnimation?> _playByKeyword(
     List<String> keywords, {
     int fallbackIndex = 0,
+    bool loop = true,
   }) async {
-    if (_tigrillo == null || _animations.isEmpty) return;
+    if (_tigrillo == null || _animations.isEmpty) return null;
     final lowered = keywords.map((word) => word.toLowerCase()).toList();
     final match = _animations.indexWhere(
       (animation) =>
@@ -609,7 +588,12 @@ class _ARExperiencePageState extends State<ARExperiencePage> {
     );
     final index = match >= 0 ? match : fallbackIndex % _animations.length;
     final animation = _animations[index];
-    await _objects?.playAnimation(_tigrillo!, animation.name, loop: true);
+    final played = await _objects?.playAnimation(
+      _tigrillo!,
+      animation.name,
+      loop: loop,
+    );
+    return played == true ? animation : null;
   }
 
   void _scheduleAutoAnimation() {
@@ -621,7 +605,7 @@ class _ARExperiencePageState extends State<ARExperiencePage> {
     if (candidates.isEmpty) return;
     final animation = candidates[_autoAnimationIndex % candidates.length];
     _autoAnimationIndex++;
-    final pauseMs = animation.durationMs.clamp(1600, 6200) + 350;
+    const pauseMs = 14000;
     _animationTimer = Timer(Duration(milliseconds: pauseMs), () async {
       if (!mounted || !_placed) return;
       if (_tigrillo == null) return;
@@ -642,34 +626,87 @@ class _ARExperiencePageState extends State<ARExperiencePage> {
     final scene = _guideScenes[index];
     final playbackId = ++_guidePlaybackId;
     _animationTimer?.cancel();
-    await _tts.stop();
+    _gestureTimer?.cancel();
+    _speaking = false;
+    await _stopNarration();
     if (!mounted || playbackId != _guidePlaybackId) return;
     setState(() {
       _currentGuideScene = index;
       _status = 'Tu anfitrión de BioInnova';
     });
-    await _playByKeyword(scene.animationKeywords, fallbackIndex: 0);
+    _speaking = _sound;
+    final gesture = await _playByKeyword(
+      scene.animationKeywords,
+      fallbackIndex: 0,
+      loop: false,
+    );
+    if (gesture != null) {
+      _gestureTimer = Timer(
+        Duration(milliseconds: gesture.durationMs.clamp(900, 5000)),
+        () {
+          if (mounted && playbackId == _guidePlaybackId && !_jumping) {
+            _playByKeyword(['talk']);
+          }
+        },
+      );
+    }
     if (!mounted || playbackId != _guidePlaybackId) return;
-    if (_sound) await _speakNaturally(scene.script, playbackId);
+    if (_sound) await _playNarration(scene.audioAsset, playbackId);
+    if (!mounted || playbackId != _guidePlaybackId) return;
+    _speaking = false;
     if (mounted && playbackId == _guidePlaybackId) {
-      _scheduleAutoAnimation();
+      if (index == _guideScenes.length - 1) {
+        await _playSurpriseJump();
+      } else {
+        _scheduleAutoAnimation();
+      }
     }
   }
 
-  Future<void> _speakNaturally(String script, int playbackId) async {
-    final phrases = script
-        .replaceAll('!', '!|')
-        .replaceAll('?', '?|')
-        .replaceAll('. ', '.|')
-        .split('|')
-        .map((phrase) => phrase.trim())
-        .where((phrase) => phrase.isNotEmpty)
-        .toList();
-    for (var index = 0; index < phrases.length; index++) {
+  Future<void> _playSurpriseJump() async {
+    if (_jumping || _speaking || !_placed || _busy || _tigrillo == null) return;
+    final clip = _animations
+        .where((item) => item.name.toLowerCase().contains('backflip'))
+        .firstOrNull;
+    if (clip == null) return;
+    final node = _tigrillo!;
+    final playbackId = _guidePlaybackId;
+    _animationTimer?.cancel();
+    _gestureTimer?.cancel();
+    _jumping = true;
+    try {
+      final played = await _objects?.playAnimation(
+        node,
+        clip.name,
+        loop: false,
+      );
+      if (played != true) return;
+      await Future<void>.delayed(Duration(milliseconds: clip.durationMs));
+      if (mounted &&
+          _placed &&
+          _tigrillo == node &&
+          playbackId == _guidePlaybackId) {
+        await _playByKeyword(['talk']);
+        _scheduleAutoAnimation();
+      }
+    } catch (error) {
+      debugPrint('No se pudo reproducir la voltereta: $error');
+    } finally {
+      _jumping = false;
+    }
+  }
+
+  Future<void> _playNarration(String asset, int playbackId) async {
+    try {
       if (!mounted || !_sound || playbackId != _guidePlaybackId) return;
-      await _tts.speak(phrases[index]);
-      if (index < phrases.length - 1) {
-        await Future<void>.delayed(const Duration(milliseconds: 180));
+      final finished = Completer<void>();
+      _narrationFinished = finished;
+      await _narration.play(AssetSource(asset.substring('assets/'.length)));
+      await finished.future;
+    } catch (error) {
+      debugPrint('No se pudo reproducir la narración $asset: $error');
+      if (mounted && playbackId == _guidePlaybackId) {
+        _setStatus('No se pudo reproducir el audio. Toca Repetir.');
       }
     }
   }
@@ -679,8 +716,10 @@ class _ARExperiencePageState extends State<ARExperiencePage> {
     if (mounted) setState(() => _busy = true);
     _guidePlaybackId++;
     _animationTimer?.cancel();
+    _gestureTimer?.cancel();
+    _speaking = false;
     try {
-      await _tts.stop();
+      await _stopNarration();
       final node = _tigrillo;
       if (node != null) {
         await _objects?.setRoamingEnabled(node, false);
@@ -709,10 +748,32 @@ class _ARExperiencePageState extends State<ARExperiencePage> {
     if (mounted) setState(() => _status = value);
   }
 
+  Future<void> _takePhoto() async {
+    if (!_placed || _busy || _capturingPhoto || _session == null) return;
+    setState(() => _capturingPhoto = true);
+    try {
+      final bytes = await _session!.captureFramedPhoto();
+      if (!mounted) return;
+      setState(() => _photoBytes = bytes);
+    } catch (error) {
+      debugPrint('No se pudo tomar la foto: $error');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('No se pudo tomar la foto: $error')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _capturingPhoto = false);
+    }
+  }
+
   @override
   void dispose() {
     _animationTimer?.cancel();
-    _tts.stop();
+    _gestureTimer?.cancel();
+    _finishNarration();
+    _narrationCompletedSubscription?.cancel();
+    _narration.dispose();
     _session?.dispose();
     super.dispose();
   }
@@ -769,6 +830,14 @@ class _ARExperiencePageState extends State<ARExperiencePage> {
               ),
             ),
           ),
+        if (_photoBytes != null && _session != null)
+          Positioned.fill(
+            child: _PhotoPreviewPage(
+              bytes: _photoBytes!,
+              session: _session!,
+              onClose: () => setState(() => _photoBytes = null),
+            ),
+          ),
       ],
     ),
   );
@@ -810,7 +879,11 @@ class _ARExperiencePageState extends State<ARExperiencePage> {
           _sound ? Icons.volume_up_rounded : Icons.volume_off_rounded,
           () {
             setState(() => _sound = !_sound);
-            if (!_sound) _tts.stop();
+            if (!_sound) {
+              _guidePlaybackId++;
+              _speaking = false;
+              _stopNarration();
+            }
           },
         ),
       ],
@@ -974,6 +1047,28 @@ class _ARExperiencePageState extends State<ARExperiencePage> {
             ),
           ),
         if (_placed)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 10),
+            child: SizedBox(
+              width: double.infinity,
+              height: 54,
+              child: FilledButton.icon(
+                onPressed: _capturingPhoto ? null : _takePhoto,
+                icon: const Icon(Icons.photo_camera_rounded, size: 23),
+                label: Text(
+                  _capturingPhoto ? 'Preparando foto…' : 'Tomar foto',
+                ),
+                style: FilledButton.styleFrom(
+                  backgroundColor: Brand.orange,
+                  foregroundColor: Colors.white,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        if (_placed)
           Row(
             children: [
               Expanded(
@@ -1074,6 +1169,155 @@ class _CharacterAnimation {
         name: map['name']?.toString() ?? '',
         durationMs: (map['durationMs'] as num?)?.toInt() ?? 3000,
       );
+}
+
+class _PhotoPreviewPage extends StatefulWidget {
+  const _PhotoPreviewPage({
+    required this.bytes,
+    required this.session,
+    required this.onClose,
+  });
+
+  final Uint8List bytes;
+  final ARSessionManager session;
+  final VoidCallback onClose;
+
+  @override
+  State<_PhotoPreviewPage> createState() => _PhotoPreviewPageState();
+}
+
+class _PhotoPreviewPageState extends State<_PhotoPreviewPage> {
+  String? _savedUri;
+  bool _working = false;
+
+  Future<String?> _saveIfNeeded() async {
+    if (_savedUri != null) return _savedUri;
+    try {
+      final uri = await widget.session.savePhoto(widget.bytes);
+      if (mounted) setState(() => _savedUri = uri);
+      return uri;
+    } on PlatformException catch (error) {
+      if (error.code == 'STORAGE_PERMISSION_REQUIRED') {
+        final permission = await Permission.storage.request();
+        if (permission.isGranted) {
+          final uri = await widget.session.savePhoto(widget.bytes);
+          if (mounted) setState(() => _savedUri = uri);
+          return uri;
+        }
+        _message('Permite guardar fotos para continuar.');
+        return null;
+      }
+      rethrow;
+    }
+  }
+
+  void _message(String text) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
+  }
+
+  Future<void> _save() async {
+    if (_working) return;
+    setState(() => _working = true);
+    try {
+      if (await _saveIfNeeded() != null) {
+        _message('Foto guardada en Imágenes / BioInnova');
+      }
+    } catch (error) {
+      _message('No se pudo guardar la foto: $error');
+    } finally {
+      if (mounted) setState(() => _working = false);
+    }
+  }
+
+  Future<void> _share() async {
+    if (_working) return;
+    setState(() => _working = true);
+    try {
+      final uri = await _saveIfNeeded();
+      if (uri != null) await widget.session.sharePhoto(uri);
+    } catch (error) {
+      _message('No se pudo compartir la foto: $error');
+    } finally {
+      if (mounted) setState(() => _working = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    backgroundColor: Brand.ink,
+    body: SafeArea(
+      child: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 10, 16, 10),
+            child: Row(
+              children: [
+                IconButton.filledTonal(
+                  onPressed: widget.onClose,
+                  icon: const Icon(Icons.close_rounded),
+                  tooltip: 'Cerrar foto',
+                ),
+                const SizedBox(width: 12),
+                const Text(
+                  'Tu foto con el tigrillo',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: Center(
+              child: Image.memory(
+                widget.bytes,
+                fit: BoxFit.contain,
+                gaplessPlayback: true,
+              ),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 14, 16, 18),
+            child: Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: _working ? null : _save,
+                    icon: Icon(
+                      _savedUri == null
+                          ? Icons.download_rounded
+                          : Icons.check_rounded,
+                    ),
+                    label: Text(_savedUri == null ? 'Guardar' : 'Guardada'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.white,
+                      side: const BorderSide(color: Colors.white38),
+                      minimumSize: const Size(0, 52),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: FilledButton.icon(
+                    onPressed: _working ? null : _share,
+                    icon: const Icon(Icons.share_rounded),
+                    label: const Text('Compartir'),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: Brand.orange,
+                      foregroundColor: Colors.white,
+                      minimumSize: const Size(0, 52),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    ),
+  );
 }
 
 class _PulsingDirectionArrow extends StatefulWidget {

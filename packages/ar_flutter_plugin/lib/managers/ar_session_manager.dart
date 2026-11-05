@@ -193,4 +193,16 @@ class ARSessionManager {
     final result = await _channel.invokeMethod<Uint8List>('snapshot');
     return MemoryImage(result!);
   }
+
+  /// Captures the camera and AR model with the event frame for this orientation.
+  Future<Uint8List> captureFramedPhoto() async =>
+      (await _channel.invokeMethod<Uint8List>('captureFramedPhoto'))!;
+
+  /// Saves the PNG to the device's Pictures/BioInnova gallery folder.
+  Future<String> savePhoto(Uint8List bytes) async =>
+      (await _channel.invokeMethod<String>('savePhoto', {'bytes': bytes}))!;
+
+  /// Opens the Android share sheet for a photo already saved in the gallery.
+  Future<void> sharePhoto(String uri) =>
+      _channel.invokeMethod<void>('sharePhoto', {'uri': uri});
 }
