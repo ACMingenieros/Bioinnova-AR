@@ -176,6 +176,9 @@ class ARObjectManager {
   Future<bool?> triggerRoaming(ARNode node) =>
       _channel.invokeMethod<bool>('triggerRoaming', {'name': node.name});
 
+  Future<bool?> callTowardCamera(ARNode node) =>
+      _channel.invokeMethod<bool>('callTowardCamera', {'name': node.name});
+
   /// Animates the character toward a tapped world position.
   Future<bool?> moveTo(ARNode node, Matrix4 worldTransform) =>
       _channel.invokeMethod<bool>('moveTo', {

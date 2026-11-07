@@ -1,6 +1,6 @@
 """Combine the BioInnova character and Mixamo FBX clips into one animated GLB.
 
-Usage: blender --background --factory-startup --python tools/export_tigrillo.py -- SOURCE_DIR OUTPUT_GLB
+Usage: blender --background --factory-startup --python tools/export_tigrillo.py -- SOURCE_DIR OUTPUT_GLB [HEART_FBX]
 """
 
 import bpy
@@ -10,6 +10,7 @@ from pathlib import Path
 
 args = sys.argv[sys.argv.index("--") + 1 :]
 source_dir, output = Path(args[0]), Path(args[1])
+heart_fbx = Path(args[2]) if len(args) > 2 else None
 clips = {
     "Walk": "Walking.fbx",
     "Run": "Running.fbx",
@@ -18,13 +19,15 @@ clips = {
     "Backflip": "Backflip_Jump.fbx",
     "Cast": "mage_soell_cast_7.fbx",
 }
+if heart_fbx is not None:
+    clips["Heart"] = heart_fbx
 
 bpy.ops.object.select_all(action="SELECT")
 bpy.ops.object.delete(use_global=False)
 
 
-def import_fbx(suffix):
-    path = next(source_dir.glob(f"*{suffix}"))
+def import_fbx(source):
+    path = source if isinstance(source, Path) else next(source_dir.glob(f"*{source}"))
     before = set(bpy.data.objects)
     bpy.ops.import_scene.fbx(filepath=str(path), use_anim=True)
     return set(bpy.data.objects) - before
@@ -40,8 +43,8 @@ for obj in list(base_objects):
 
 armature.animation_data_create()
 armature.animation_data.action = None
-for clip_name, suffix in clips.items():
-    imported = import_fbx(suffix)
+for clip_name, source in clips.items():
+    imported = import_fbx(source)
     source_armature = next(obj for obj in imported if obj.type == "ARMATURE")
     source_bones = {bone.name for bone in source_armature.data.bones}
     if source_bones != base_bones:

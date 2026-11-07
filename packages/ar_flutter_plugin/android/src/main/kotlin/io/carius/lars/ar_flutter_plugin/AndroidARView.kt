@@ -82,6 +82,7 @@ internal class AndroidARView(
 ) : PlatformView {
     // constants
     private val TAG: String = AndroidARView::class.java.name
+    private var isDisposed = false
     // Lifecycle variables
     private var mUserRequestedInstall = true
     lateinit var activityLifecycleCallbacks: Application.ActivityLifecycleCallbacks
@@ -176,6 +177,7 @@ internal class AndroidARView(
                         }
                         "dispose" -> {
                             dispose()
+                            result.success(null)
                         }
                         else -> {}
                     }
@@ -289,10 +291,32 @@ internal class AndroidARView(
                                 result.success(false)
                             } else {
                                 val target = Vector3(matrix[12].toFloat(), matrix[13].toFloat(), matrix[14].toFloat())
-                                result.success(
-                                    target.y - node.worldPosition.y <= 0.35f &&
-                                        animateCharacterTo(name, node, target),
+                                val camera = arSceneView.scene.camera
+                                val cameraLocal = camera.worldToLocalPoint(node.worldPosition)
+                                val screen = camera.worldToScreenPoint(node.worldPosition)
+                                val outOfView = cameraLocal.z >= 0f || screen.x < 0f ||
+                                    screen.x > arSceneView.width || screen.y < 0f || screen.y > arSceneView.height
+                                val destination = if (outOfView) Vector3(
+                                    camera.worldPosition.x + camera.forward.x * 1.35f,
+                                    node.worldPosition.y,
+                                    camera.worldPosition.z + camera.forward.z * 1.35f,
+                                ) else Vector3(target.x, node.worldPosition.y, target.z)
+                                result.success(animateCharacterTo(name, node, destination))
+                            }
+                        }
+                        "callTowardCamera" -> {
+                            val name = call.argument<String>("name")
+                            val node = name?.let { arSceneView.scene.findByName(it) }
+                            if (name == null || node == null) {
+                                result.success(false)
+                            } else {
+                                val camera = arSceneView.scene.camera
+                                val target = Vector3(
+                                    camera.worldPosition.x + camera.forward.x * 1.35f,
+                                    node.worldPosition.y,
+                                    camera.worldPosition.z + camera.forward.z * 1.35f,
                                 )
+                                result.success(animateCharacterTo(name, node, target))
                             }
                         }
                         "transformationChanged" -> {
@@ -384,12 +408,13 @@ internal class AndroidARView(
     }
 
     override fun dispose() {
+        if (isDisposed) return
+        isDisposed = true
         // Destroy AR session
         Log.d(TAG, "dispose called")
         try {
             onPause()
             onDestroy()
-            ArSceneView.destroyAllResources()
         } catch (e: Exception) {
             e.printStackTrace()
         }
@@ -915,7 +940,7 @@ internal class AndroidARView(
         val dz = target.z - start.z
         val distance = kotlin.math.sqrt(dx * dx + dz * dz)
         if (distance < 0.15f) return false
-        val end = Vector3(target.x, target.y, target.z)
+        val end = Vector3(target.x, start.y, target.z)
         val travelYaw = Math.toDegrees(atan2(dx.toDouble(), dz.toDouble())).toFloat()
         val startRotation = node.localRotation
         val travelRotation = com.google.ar.sceneform.math.Quaternion.axisAngle(
@@ -1177,7 +1202,10 @@ internal class AndroidARView(
                         if (anchorName != null) {
                             val anchorNode = arSceneView.scene.findByName(anchorName) as? AnchorNode
                             if (anchorNode != null) {
-                                anchorNode.addChild(node)
+                                // Keep the mascot visible when ARCore temporarily loses
+                                // tracking of the plane anchor during a camera turn.
+                                arSceneView.scene.addChild(node)
+                                node.worldPosition = anchorNode.worldPosition
                                 animateAppearance(node)
                                 completableFutureSuccess.complete(true)
                             } else {

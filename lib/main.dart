@@ -17,6 +17,8 @@ import 'package:audioplayers/audioplayers.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:vector_math/vector_math_64.dart' as vm;
 
+import 'album_upload.dart';
+
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   SystemChrome.setSystemUIOverlayStyle(
@@ -49,7 +51,7 @@ const _guideScenes = <_GuideScene>[
         'Encuentro Regional Amazónico de Incubadoras y Emprendimientos San '
         'Martín 2026! Soy el anfitrión de BioInnova San Martín y hoy los '
         'acompañaré en esta gran experiencia de innovación y emprendimiento.',
-    animationKeywords: ['wave'],
+    animationKeywords: ['heart'],
     directionIcon: Icons.waving_hand_rounded,
   ),
   _GuideScene(
@@ -498,6 +500,15 @@ class _ARExperiencePageState extends State<ARExperiencePage> {
         )
         .firstOrNull;
     if (hit == null) {
+      if (_placed && _tigrillo != null) {
+        final moved = await _objects?.callTowardCamera(_tigrillo!);
+        _setStatus(
+          moved == true
+              ? '¡Voy hacia ti!'
+              : 'Apunta al suelo y toca para moverme.',
+        );
+        return;
+      }
       _setStatus(
         _placed
             ? 'Apunta al suelo o a una mesa y toca adonde debe ir.'
@@ -506,7 +517,10 @@ class _ARExperiencePageState extends State<ARExperiencePage> {
       return;
     }
     if (_placed) {
+      _animationTimer?.cancel();
+      _gestureTimer?.cancel();
       final moved = await _objects?.moveTo(_tigrillo!, hit.worldTransform);
+      if (moved != true) await _objects?.callTowardCamera(_tigrillo!);
       _setStatus(
         moved == true
             ? '¡Allá voy! Toca otro lugar para moverme.'
@@ -553,6 +567,7 @@ class _ARExperiencePageState extends State<ARExperiencePage> {
         });
       }
       await _loadAnimations(node);
+      await _objects?.setRoamingEnabled(node, false);
       _setStatus('Toca otro lugar de la cámara para que vaya hacia allí.');
       if (mounted) setState(() => _busy = false);
       await Future<void>.delayed(const Duration(milliseconds: 950));
@@ -609,6 +624,10 @@ class _ARExperiencePageState extends State<ARExperiencePage> {
     _animationTimer = Timer(Duration(milliseconds: pauseMs), () async {
       if (!mounted || !_placed) return;
       if (_tigrillo == null) return;
+      if (_speaking || _jumping) {
+        _scheduleAutoAnimation();
+        return;
+      }
       await _objects?.playAnimation(_tigrillo!, animation.name, loop: false);
       _animationTimer = Timer(
         Duration(milliseconds: animation.durationMs.clamp(900, 5000)),
@@ -642,7 +661,7 @@ class _ARExperiencePageState extends State<ARExperiencePage> {
     );
     if (gesture != null) {
       _gestureTimer = Timer(
-        Duration(milliseconds: gesture.durationMs.clamp(900, 5000)),
+        Duration(milliseconds: gesture.durationMs.clamp(900, 10000)),
         () {
           if (mounted && playbackId == _guidePlaybackId && !_jumping) {
             _playByKeyword(['talk']);
@@ -655,7 +674,7 @@ class _ARExperiencePageState extends State<ARExperiencePage> {
     if (!mounted || playbackId != _guidePlaybackId) return;
     _speaking = false;
     if (mounted && playbackId == _guidePlaybackId) {
-      if (index == _guideScenes.length - 1) {
+      if (index == 0 || index == _guideScenes.length - 1) {
         await _playSurpriseJump();
       } else {
         _scheduleAutoAnimation();
@@ -664,7 +683,7 @@ class _ARExperiencePageState extends State<ARExperiencePage> {
   }
 
   Future<void> _playSurpriseJump() async {
-    if (_jumping || _speaking || !_placed || _busy || _tigrillo == null) return;
+    if (_jumping || !_placed || _busy || _tigrillo == null) return;
     final clip = _animations
         .where((item) => item.name.toLowerCase().contains('backflip'))
         .firstOrNull;
@@ -1032,7 +1051,9 @@ class _ARExperiencePageState extends State<ARExperiencePage> {
                         ),
                       ),
                       Text(
-                        'Descubre el encuentro conmigo',
+                        _currentGuideScene == 0
+                            ? 'Tócame para verme saltar'
+                            : 'Descubre el encuentro conmigo',
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: const TextStyle(
@@ -1072,12 +1093,11 @@ class _ARExperiencePageState extends State<ARExperiencePage> {
           Row(
             children: [
               Expanded(
-                child: _action(
-                  Icons.my_location_rounded,
-                  'Ubicar',
-                  _removePlaced,
-                  outline: true,
-                ),
+                child: _action(Icons.my_location_rounded, 'Ven aquí', () async {
+                  if (_tigrillo != null) {
+                    await _objects?.callTowardCamera(_tigrillo!);
+                  }
+                }, outline: true),
               ),
               const SizedBox(width: 9),
               Expanded(
@@ -1189,6 +1209,24 @@ class _PhotoPreviewPage extends StatefulWidget {
 class _PhotoPreviewPageState extends State<_PhotoPreviewPage> {
   String? _savedUri;
   bool _working = false;
+  bool _uploading = false;
+  bool _uploaded = false;
+
+  Future<void> _upload() async {
+    if (_uploading || _uploaded) return;
+    setState(() => _uploading = true);
+    try {
+      await uploadPhotoToAlbum(widget.bytes);
+      if (mounted) {
+        setState(() => _uploaded = true);
+        _message('Foto añadida al álbum del evento');
+      }
+    } catch (error) {
+      _message('No se pudo subir al álbum: $error');
+    } finally {
+      if (mounted) setState(() => _uploading = false);
+    }
+  }
 
   Future<String?> _saveIfNeeded() async {
     if (_savedUri != null) return _savedUri;
@@ -1280,36 +1318,64 @@ class _PhotoPreviewPageState extends State<_PhotoPreviewPage> {
           ),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 14, 16, 18),
-            child: Row(
+            child: Column(
               children: [
-                Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: _working ? null : _save,
+                SizedBox(
+                  width: double.infinity,
+                  child: FilledButton.icon(
+                    onPressed: _uploading || _uploaded ? null : _upload,
                     icon: Icon(
-                      _savedUri == null
-                          ? Icons.download_rounded
-                          : Icons.check_rounded,
+                      _uploaded
+                          ? Icons.check_rounded
+                          : Icons.cloud_upload_outlined,
                     ),
-                    label: Text(_savedUri == null ? 'Guardar' : 'Guardada'),
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: Colors.white,
-                      side: const BorderSide(color: Colors.white38),
+                    label: Text(
+                      _uploaded
+                          ? 'Foto en el álbum'
+                          : _uploading
+                          ? 'Subiendo al álbum…'
+                          : 'Subir al álbum',
+                    ),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: Brand.lime,
+                      foregroundColor: Brand.ink,
                       minimumSize: const Size(0, 52),
                     ),
                   ),
                 ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: FilledButton.icon(
-                    onPressed: _working ? null : _share,
-                    icon: const Icon(Icons.share_rounded),
-                    label: const Text('Compartir'),
-                    style: FilledButton.styleFrom(
-                      backgroundColor: Brand.orange,
-                      foregroundColor: Colors.white,
-                      minimumSize: const Size(0, 52),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: _working ? null : _save,
+                        icon: Icon(
+                          _savedUri == null
+                              ? Icons.download_rounded
+                              : Icons.check_rounded,
+                        ),
+                        label: Text(_savedUri == null ? 'Guardar' : 'Guardada'),
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: Colors.white,
+                          side: const BorderSide(color: Colors.white38),
+                          minimumSize: const Size(0, 52),
+                        ),
+                      ),
                     ),
-                  ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: FilledButton.icon(
+                        onPressed: _working ? null : _share,
+                        icon: const Icon(Icons.share_rounded),
+                        label: const Text('Compartir'),
+                        style: FilledButton.styleFrom(
+                          backgroundColor: Brand.orange,
+                          foregroundColor: Colors.white,
+                          minimumSize: const Size(0, 52),
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
               ],
             ),
